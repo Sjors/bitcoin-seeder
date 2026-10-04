@@ -228,19 +228,36 @@ class CNode {
       }
       DataStream vMsg{payload};
       vRecv.erase(vRecv.begin(), vRecv.begin() + nHeaderSize + nMessageSize);
-      if (ProcessMessage(strCommand, vMsg))
+      bool fStop;
+      try {
+        fStop = ProcessMessage(strCommand, vMsg);
+      } catch (const std::ios_base::failure&) {
+        // The message could not be deserialized.
+        close(sock);
+        sock = INVALID_SOCKET;
+        return true;
+      }
+      if (fStop)
         return true;
     } while(1);
     return false;
   }
   
 public:
-  CNode(const CService& ip, vector<CAddress>* vAddrIn) : you(ip), vAddr(vAddrIn), ban(0), doneAfter(0), nVersion(0), nStartingHeight(0) {
+  CNode(const CService& ip, vector<CAddress>* vAddrIn) : sock(INVALID_SOCKET), you(ip), vAddr(vAddrIn), ban(0), doneAfter(0), nVersion(0), nStartingHeight(0) {
     fGotVersion = false;
     fGotVerAck = false;
     fGotAddr = false;
     fWaitKnownBlock = false;
   }
+  CNode(const CNode&) = delete;
+  CNode& operator=(const CNode&) = delete;
+
+  ~CNode() {
+    // Make sure the socket is closed, also if processing was aborted (e.g. by an exception).
+    if (sock != INVALID_SOCKET) close(sock);
+  }
+
   bool Run() {
     bool res = true;
     const int64_t start = time(NULL);
