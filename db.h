@@ -198,14 +198,19 @@ struct CServiceResult {
 
 class CAddrDb {
 private:
+  // At 100,000 entries the address database uses roughly 40 MiB. Keep separate limits so
+  // peer-supplied addresses and bans cannot grow without bound.
+  static constexpr size_t MAX_ADDR_DB_ENTRIES = 100000;
+  static constexpr size_t MAX_BANNED_DB_ENTRIES = 100000;
   mutable CCriticalSection cs;
-  int nId; // number of address id's
+  int nId{0}; // next address id
   std::map<int, CAddrInfo> idToInfo; // map address id to address info (b,c,d,e)
   std::map<CService, int> ipToId; // map ip to id (b,c,d,e)
   std::deque<int> ourId; // sequence of tried nodes, in order we have tried connecting to them (c,d)
   std::set<int> unkId; // set of nodes not yet tried (b)
   std::set<int> goodId; // set of good nodes  (d, good e)
-  int nDirty;
+  int nDirty{0};
+  int64_t lastBanPrune{0};
   
 protected:
   // internal routines that assume proper locks are acquired
@@ -216,6 +221,9 @@ protected:
   void Bad_(const CService &ip, int ban);  // mark an IP as bad (and optionally ban it) (must have been returned by Get_)
   void Skipped_(const CService &ip);       // mark an IP as skipped (must have been returned by Get_)
   int Lookup_(const CService &ip);         // look up id of an IP
+  int NextId_();                            // choose an unused id, including after wraparound
+  bool MakeRoom_();                         // evict an untested or non-good node when full
+  void PruneBans_();                        // discard expired bans at most once per hour
   void GetIPs_(std::set<CNetAddr>& ips, uint64_t requestedFlags, int max, const bool *nets); // get a random set of good IPs (shared lock only)
 
 public:
@@ -280,14 +288,20 @@ public:
     int nVersion;
     s >> nVersion;
     CRITICAL_BLOCK(cs) {
+      idToInfo.clear();
+      ipToId.clear();
+      ourId.clear();
+      unkId.clear();
+      goodId.clear();
+      banned.clear();
       nId = 0;
       int n;
       s >> n;
       for (int i=0; i<n; i++) {
         CAddrInfo info;
         s >> info;
-        if (!info.GetBanTime()) {
-          int id = nId++;
+        if (!info.GetBanTime() && !ipToId.count(info.ip) && MakeRoom_()) {
+          int id = NextId_();
           idToInfo[id] = info;
           ipToId[info.ip] = id;
           if (info.ourLastTry) {
@@ -299,7 +313,16 @@ public:
         }
       }
       nDirty++;
-      s >> banned;
+      // Read all serialized bans without retaining more than the limit. The file may predate
+      // this limit, so deserializing directly into the map could itself exhaust memory.
+      uint64_t nBanned = ReadCompactSize(s);
+      const int64_t now = time(NULL);
+      for (uint64_t i=0; i<nBanned; ++i) {
+        std::pair<CService, int64_t> entry;
+        s >> entry;
+        if (entry.second > now && banned.size() < MAX_BANNED_DB_ENTRIES)
+          banned.insert(entry);
+      }
     }
   }
 

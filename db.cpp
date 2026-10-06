@@ -1,5 +1,6 @@
 #include "db.h"
 #include <stdlib.h>
+#include <climits>
 
 using namespace std;
 
@@ -66,6 +67,51 @@ int CAddrDb::Lookup_(const CService &ip) {
   return -1;
 }
 
+int CAddrDb::NextId_() {
+  if (nId == INT_MAX) nId = 0;
+  while (idToInfo.count(nId)) {
+    if (++nId == INT_MAX) nId = 0;
+  }
+  return nId++;
+}
+
+bool CAddrDb::MakeRoom_() {
+  if (idToInfo.size() < MAX_ADDR_DB_ENTRIES) return true;
+
+  int id = -1;
+  // Prefer replacing a previously tried non-good peer over a fresh candidate. Look only near
+  // the front of the retry queue so admission remains cheap under a flood.
+  auto it = ourId.begin();
+  for (size_t scanned = 0; it != ourId.end() && scanned < 32; ++it, ++scanned) {
+    if (!goodId.count(*it)) {
+      id = *it;
+      ourId.erase(it);
+      break;
+    }
+  }
+  if (id < 0 && !unkId.empty()) {
+    id = *unkId.begin();
+    unkId.erase(unkId.begin());
+  }
+  if (id < 0) return false; // All candidates are good or currently being tested.
+
+  ipToId.erase(idToInfo.at(id).ip);
+  goodId.erase(id);
+  idToInfo.erase(id);
+  nDirty++;
+  return true;
+}
+
+void CAddrDb::PruneBans_() {
+  const int64_t now = time(NULL);
+  if (now - lastBanPrune < 3600) return;
+  lastBanPrune = now;
+  for (auto it = banned.begin(); it != banned.end();) {
+    if (it->second <= now) it = banned.erase(it);
+    else ++it;
+  }
+}
+
 void CAddrDb::Good_(const CService &addr, int clientV, std::string clientSV, int blocks, uint64_t services) {
   int id = Lookup_(addr);
   if (id == -1) return;
@@ -97,7 +143,9 @@ void CAddrDb::Bad_(const CService &addr, int ban)
     if (ban < ter) ban = ter;
   }
   if (ban > 0) {
-    banned[info.ip] = ban + now;
+    if (banned.size() >= MAX_BANNED_DB_ENTRIES && !banned.count(info.ip)) PruneBans_();
+    if (banned.size() < MAX_BANNED_DB_ENTRIES || banned.count(info.ip))
+      banned[info.ip] = ban + now;
     ipToId.erase(info.ip);
     goodId.erase(id);
     idToInfo.erase(id);
@@ -140,6 +188,7 @@ void CAddrDb::Add_(const CAddress &addr, bool force) {
     }
     return;
   }
+  if (!MakeRoom_()) return;
   CAddrInfo ai;
   ai.ip = ipp;
   ai.services = addr.nServices;
@@ -147,7 +196,7 @@ void CAddrDb::Add_(const CAddress &addr, bool force) {
   ai.ourLastTry = 0;
   ai.total = 0;
   ai.success = 0;
-  int id = nId++;
+  int id = NextId_();
   idToInfo[id] = ai;
   ipToId[ipp] = id;
   unkId.insert(id);
