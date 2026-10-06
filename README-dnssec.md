@@ -66,12 +66,18 @@ settings:
 
 ```conf
 recursion no;
+minimal-responses yes;
 allow-query { any; };
 allow-transfer { none; };
 querylog no;
 listen-on { any; };
 listen-on-v6 { any; };
 ```
+
+`minimal-responses yes` omits optional authority and additional records from
+positive address replies, keeping ordinary A/AAAA answers within
+the exporter's 512-byte budget. It does not omit signatures or denial
+records required when DNSSEC is requested.
 
 Keep the `seeder` user out of the `bind` group: members can read
 `/etc/bind/rndc.key` and administer BIND with `rndc`. Instead, give the
@@ -247,13 +253,50 @@ runs the reload command. The zone contains the SOA and NS records (from `-h`,
 nodes, at the zone apex and at each filter name that the seeder supports
 (such as `x9.dnsseed.example.com`; see its `-w` option).
 
-The number of A and AAAA records per name is as many as fit in a 512-byte
-answer (29 A or 16 AAAA records for `dnsseed.example.com`; fewer for longer
-names). That is the limit for clients that don't use EDNS when asking their
-resolver (such as glibc's resolver, unless `options edns0` is set). Larger
-answers make those clients retry over TCP, and their lookup fails entirely if
-that doesn't work (glibc doesn't use the truncated answer). Between resolvers
-and BIND, EDNS is used, and signed answers fit in the usual 1232-byte buffer.
+The exporter caps the number of A and AAAA records per name so that an
+ordinary address reply fits within 512 bytes (26 A or 15 AAAA records for
+`dnsseed.example.com`; fewer for longer names).
+
+There are two separate DNS exchanges in this setup:
+
+| DNS exchange | UDP reply limit | Contents of an address reply |
+| --- | --- | --- |
+| BIND to a validating resolver | Normally 1232 bytes, using EDNS | Addresses and DNSSEC signatures |
+| Resolver to a client without EDNS | 512 bytes | Addresses without DNSSEC signatures |
+
+Without EDNS, DNS replies over UDP have a 512-byte limit. EDNS lets a
+query advertise that larger replies are acceptable; BIND's default is
+1232 bytes, chosen to reduce the risk of IP fragmentation. These are DNS
+message limits, rather than limits imposed by UDP itself.
+
+The validating resolver checks BIND's signatures before returning the
+addresses to the client. Clients such as glibc's resolver do not use EDNS
+by default (unless `options edns0` is set), so the export cap lets their
+resolver return a complete address reply within the smaller 512-byte
+limit. With the default signing policy, the signed address replies from
+BIND fit within the larger 1232-byte limit.
+
+The export cap reserves 55 bytes for EDNS: the 11-byte OPT record and a
+COOKIE option with its 4-byte header, 8-byte client cookie and up to 32-byte
+server cookie. This lets clients advertising only 512 bytes through EDNS
+receive complete address replies with cookies, without disabling BIND's
+cookie support. An empty OPT record also fits within this budget. Extra
+options, such as NSID if configured, may require more space.
+
+Ordinary address replies and, with the default signing policy, signed
+address replies fit the respective 512-byte and 1232-byte UDP limits above.
+A requester asking for DNSSEC signatures while advertising only 512 bytes
+may need TCP. Signed denial replies prove that a name or address family has
+no records, for example a valid filter with no matching peers or an AAAA
+query for a name with only IPv4 addresses. These replies usually fit within
+1232 bytes, but their size is not controlled by the address cap: long names
+or multiple proof records can make them exceed that limit.
+
+Keep TCP port 53 reachable as well as UDP so these queries can still
+succeed. When a reply exceeds the requester's UDP limit, BIND sets the
+truncation (`TC`) flag and the resolver retries over TCP to obtain the full
+reply. Blocking TCP can cause these lookups to fail even though ordinary
+UDP address lookups work.
 
 The TTL of the records is the export interval. Unlike with the built-in DNS
 server, which selects addresses for every query, all clients get the same
@@ -309,20 +352,39 @@ runuser -u seeder -- /usr/bin/sudo -n /usr/sbin/rndc -k /etc/bind/rndc.key -s 12
 
 Both permission checks and the reload command should exit successfully.
 
+Check ordinary address answers over UDP without EDNS. `+ignore` prevents
+`dig` from hiding truncation by retrying over TCP:
+
+```sh
+dig @127.0.0.1 dnsseed.example.com A +noedns +norecurse +ignore
+dig @127.0.0.1 dnsseed.example.com AAAA +noedns +norecurse +ignore
+```
+
+Expect complete address answers without the `tc` flag. Also check EDNS
+clients advertising only 512 bytes and requesting cookies:
+
+```sh
+dig @127.0.0.1 dnsseed.example.com A +nodnssec +bufsize=512 +cookie +norecurse +ignore
+dig @127.0.0.1 dnsseed.example.com AAAA +nodnssec +bufsize=512 +cookie +norecurse +ignore
+```
+
+These replies should also be complete, without the `tc` flag.
+
 Check local authoritative answers over UDP and TCP:
 
 ```sh
 dig @127.0.0.1 dnsseed.example.com SOA +dnssec +norecurse
-dig @127.0.0.1 dnsseed.example.com A +dnssec +norecurse
-dig @127.0.0.1 dnsseed.example.com AAAA +dnssec +norecurse
-dig @127.0.0.1 x49.dnsseed.example.com A +dnssec +norecurse
+dig @127.0.0.1 dnsseed.example.com A +dnssec +bufsize=1232 +norecurse +ignore
+dig @127.0.0.1 dnsseed.example.com AAAA +dnssec +bufsize=1232 +norecurse +ignore
+dig @127.0.0.1 x49.dnsseed.example.com A +dnssec +bufsize=1232 +norecurse +ignore
 dig @127.0.0.1 x49.dnsseed.example.com AAAA +dnssec +norecurse +tcp
 ```
 
 Expect `status: NOERROR` and the `aa` flag. Nonempty address answers should
-include their RRSIG. Empty answers should include signed denial records in
-the authority section. An RRSIG proves that signatures are being served;
-validation also requires the parent DS chain.
+include their RRSIG, and nonempty UDP address answers should not have the
+`tc` flag. Empty answers should include signed denial records in the authority
+section. An RRSIG proves that signatures are being served; validation also
+requires the parent DS chain.
 
 After publishing the NS and DS records and allowing caches to expire, test
 with a validating resolver:

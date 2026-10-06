@@ -558,17 +558,21 @@ static ZoneExportConfig zoneExport;
 /** Maximum time (in seconds) the reload command may run (if the export interval isn't shorter). */
 static const int ZONE_RELOAD_TIMEOUT = 60;
 
-/** Maximum size of answers from the exported zone: the limit for clients that don't use EDNS (such
- *  as glibc by default). Larger answers make those clients retry over TCP, and their lookups fail
- *  entirely if that doesn't work. */
+/** Maximum size of ordinary address replies, including EDNS cookies but excluding DNSSEC
+ *  signatures. This also serves clients such as glibc that do not use EDNS by default. Validating
+ *  resolvers fetch signed replies using a larger EDNS budget, normally 1232 bytes. */
 static const size_t ZONE_MAX_ANSWER_SIZE = 512;
 
+/** Reserve an OPT record (11 bytes) and a COOKIE option: 4-byte option header, 8-byte client
+ *  cookie, and up to 32 bytes for the server cookie (RFC 7873). */
+static const size_t ZONE_EDNS_RESERVE = 11 + 4 + 8 + 32;
+
 /** Determine how many address records with rdlen-byte addresses fit in an answer for the given
- *  absolute name, without exceeding ZONE_MAX_ANSWER_SIZE. */
+ *  absolute name, leaving room for EDNS cookies and without exceeding ZONE_MAX_ANSWER_SIZE. */
 static size_t MaxZoneAddrs(const std::string& name, size_t rdlen) {
   // Header (12 bytes), and question: name (in wire format, one byte longer than its absolute text
-  // form), type and class (4 bytes).
-  const size_t fixed = 12 + name.size() + 1 + 4;
+  // form), type and class (4 bytes). Reserve space for EDNS even for clients that do not use it.
+  const size_t fixed = 12 + name.size() + 1 + 4 + ZONE_EDNS_RESERVE;
   // Each record: compressed owner name (2 bytes), type, class, TTL and rdlength (10 bytes), and the
   // address.
   return fixed < ZONE_MAX_ANSWER_SIZE ? (ZONE_MAX_ANSWER_SIZE - fixed) / (12 + rdlen) : 0;
